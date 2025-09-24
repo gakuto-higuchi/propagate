@@ -1,6 +1,7 @@
-import io, json, time, math
+import io, json, time
 from datetime import datetime, timedelta
 import requests, pandas as pd, streamlit as st
+from openai import OpenAI  # ← 公式SDK
 
 st.set_page_config(page_title="AdAI 配分ビュー（CSV→要約→gpt-5）", layout="wide")
 
@@ -51,7 +52,6 @@ def parse_wide_csv(csv_text: str) -> pd.DataFrame:
             cols.append((pd.to_datetime(c), c))
         except Exception:
             cols.append((None, c))
-    # 日付として解釈できた列のみソートして先に、非日付は末尾
     date_cols = sorted([c for d, c in cols if d is not None])
     other_cols = [c for d, c in cols if d is None]
     df = df[date_cols + other_cols]
@@ -64,9 +64,7 @@ def parse_wide_csv(csv_text: str) -> pd.DataFrame:
 # 直近7日要約の算出（facts + channels）
 # ---------------------------
 def last_n(series: pd.Series, n=7):
-    # 後ろからn件の非NaN
-    vals = series.dropna().iloc[-n:]
-    return vals
+    return series.dropna().iloc[-n:]
 
 def safe_median(series: pd.Series, n=7):
     vals = last_n(series, n)
@@ -77,11 +75,9 @@ def safe_sum(series: pd.Series, n=7):
     return float(vals.sum()) if len(vals) else 0.0
 
 def build_features(df: pd.DataFrame, meta: dict):
-    # meta から期間
     ads_min = pd.to_datetime(meta.get("adsMinDate"))
     ads_max = pd.to_datetime(meta.get("adsMaxDate"))
     if pd.isna(ads_max):
-        # DataFrameの最後の日付列から推定
         try:
             ads_max = pd.to_datetime([c for c in df.columns if c[:4].isdigit()][-1])
         except Exception:
@@ -90,14 +86,11 @@ def build_features(df: pd.DataFrame, meta: dict):
     month_start = ads_max.replace(day=1).strftime("%Y-%m-%d")
     month_end = (ads_max + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d")
 
-    # 全体コスト系列
     cost_all = df.loc["コスト_ALL"].dropna()
-    # MTD（今月分合計）
     m_mask = (pd.to_datetime(cost_all.index) >= pd.to_datetime(month_start)) & \
              (pd.to_datetime(cost_all.index) <= ads_max)
     mtd_spend = float(cost_all[m_mask].sum()) if len(cost_all[m_mask]) else 0.0
 
-    # 参照候補
     yesterday_total = float(cost_all.iloc[-1]) if len(cost_all) else 0.0
     avg_last3 = float(last_n(cost_all, 3).mean()) if len(last_n(cost_all, 3)) else 0.0
     median_last7 = float(last_n(cost_all, 7).median()) if len(last_n(cost_all, 7)) else 0.0
@@ -139,7 +132,7 @@ def build_features(df: pd.DataFrame, meta: dict):
     return features
 
 # ---------------------------
-# LLM（OpenAI / gpt-5）
+# LLM（OpenAI / gpt-5） 公式SDKでJSON固定
 # ---------------------------
 BASE_INSTRUCTIONS = """あなたは広告予算配分の最適化アシスタントです。出力は厳密なJSONオブジェクトのみで返してください（余分な文章・コードフェンス不可）。
 
@@ -194,33 +187,24 @@ BASE_INSTRUCTIONS = """あなたは広告予算配分の最適化アシスタン
 def build_llm_input(features: dict) -> str:
     return BASE_INSTRUCTIONS + json.dumps(features, ensure_ascii=False, separators=(",", ":"))
 
-def call_openai_chat(prompt: str) -> str:
+def run_openai_chat(prompt: str) -> dict:
+    """OpenAI SDKでChat Completions。JSON固定で安全に返す"""
     api_key = st.secrets["OPENAI_API_KEY"]
-    base_url = st.secrets.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    base_url = st.secrets.get("OPENAI_BASE_URL", None)  # 例: プロキシ/Enterprise/Azure互換
     model = st.secrets.get("OPENAI_MODEL", "gpt-5")
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are an expert ads budget allocation assistant. Output valid JSON only."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2,
-    }
-    r = requests.post(f"{base_url}/chat/completions",
-                      headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                      json=body, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"]
 
-def strip_code_fence(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```"):
-        parts = s.split("```")
-        if len(parts) >= 3:
-            s = parts[1]
-        s = s.replace("json", "", 1).strip()
-    return s.strip("` \n\r\t")
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    resp = client.chat.completions.create(
+        model=model,
+        response_format={"type": "json_object"},  # ← JSON固定
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": "You are an expert ads budget allocation assistant. Output valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    text = resp.choices[0].message.content
+    return json.loads(text)  # JSON確定なので素直にロード
 
 def enforce_constraints(obj: dict) -> dict:
     medias = ["IGFB","Google","YT","Tik"]
@@ -258,7 +242,7 @@ with st.expander("手順", expanded=True):
                 "2) **要約生成**: 直近7日の中央値/合計などを自動算出（facts/channels）\n"
                 "3) **推論を実行**: gpt-5 へ要約JSONを渡し、最終配分JSONを生成")
 
-c1, c2, c3 = st.columns([1,1,3])
+c1, c2, _ = st.columns([1,1,3])
 
 with c1:
     if st.button("データ取得", type="primary"):
@@ -298,7 +282,10 @@ with c2:
 # プレビュー
 if st.session_state.df is not None:
     st.subheader("CSVプレビュー（先頭数行）")
-    st.dataframe(st.session_state.df.iloc[:10, -7:], use_container_width=True)
+    # 列数が少ないケースもケア
+    preview_cols = st.session_state.df.columns[-min(7, len(st.session_state.df.columns)):]
+    st.dataframe(st.session_state.df.iloc[:10, :][preview_cols], use_container_width=True)
+
     st.subheader("要約（LLM入力）")
     st.code(json.dumps(st.session_state.features, ensure_ascii=False, indent=2))
 else:
@@ -317,15 +304,10 @@ else:
             with st.spinner("gpt-5 で推論中…"):
                 try:
                     prompt = build_llm_input(st.session_state.features)
-                    out = call_openai_chat(prompt)
-                    out = strip_code_fence(out)
-                    result = json.loads(out)
-                    result = enforce_constraints(result)
+                    result = run_openai_chat(prompt)          # ← SDK版に置き換え
+                    result = enforce_constraints(result)      # 最終整合
                     st.session_state.result = result
                     st.success("推論成功")
-                except json.JSONDecodeError as e:
-                    st.error(f"LLM出力がJSONとして解釈できませんでした: {e}")
-                    st.text(out[:1000] if isinstance(out, str) else str(out))
                 except requests.exceptions.HTTPError as e:
                     st.error(f"OpenAI API エラー: {e}")
                 except Exception as e:
@@ -359,4 +341,4 @@ if res:
                        file_name="allocation_result.json",
                        mime="application/json")
 
-st.caption("※ CSV（wide）から必要指標をPythonで要約→gpt-5に渡して配分JSONを生成します。")
+st.caption("※ CSV（wide）→要約（last7等）→ gpt-5(JSON固定) → 最終整合 の流れ。")
