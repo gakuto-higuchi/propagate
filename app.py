@@ -1,21 +1,22 @@
-import json, time
+import io, json, time, math
+from datetime import datetime, timedelta
 import requests, pandas as pd, streamlit as st
 
-st.set_page_config(page_title="AdAI 配分ビュー", layout="wide")
+st.set_page_config(page_title="AdAI 配分ビュー（CSV→要約→gpt-5）", layout="wide")
 
 # ---------------------------
-# セッション状態の初期化
+# セッション状態
 # ---------------------------
-if "src" not in st.session_state:
-    st.session_state.src = None        # 取得した n8n JSON（加工後）
-if "result" not in st.session_state:
-    st.session_state.result = None     # LLMの最終配分JSON
+if "raw" not in st.session_state:      st.session_state.raw = None     # n8n生JSON
+if "df" not in st.session_state:       st.session_state.df = None      # wide DataFrame
+if "features" not in st.session_state: st.session_state.features = None# LLM入力の要約JSON
+if "result" not in st.session_state:   st.session_state.result = None  # LLMの結果JSON
 
 # ---------------------------
-# n8n 取得（手動実行のみ）
+# 取得（手動のみ / Bearer無し。BasicはSecretsがあれば自動使用）
 # ---------------------------
 def _http_get_latest(timeout_s: int = 20):
-    url = st.secrets["N8N_JSON_URL"]  # 例: https://yuya.app.n8n.cloud/webhook/latest
+    url = st.secrets["N8N_JSON_URL"]
     auth = None
     if "N8N_BASIC_USER" in st.secrets and "N8N_BASIC_PASS" in st.secrets:
         auth = (st.secrets["N8N_BASIC_USER"], st.secrets["N8N_BASIC_PASS"])
@@ -23,27 +24,119 @@ def _http_get_latest(timeout_s: int = 20):
     r.raise_for_status()
     return r.json()
 
-def pick_source(raw):
-    # n8n が配列で返すケースも吸収（先頭を採用）
-    if isinstance(raw, list):
-        return raw[0] if raw and isinstance(raw[0], dict) else {}
-    return raw if isinstance(raw, dict) else {}
-
 def fetch_latest_manual(force: bool = False):
-    """手動取得（必要ならキャッシュを明示クリアして再取得）"""
-    if force:
-        st.cache_data.clear()
-    # 段階的リトライ（上限~70秒）
+    if force: st.cache_data.clear()
     timeouts = [10, 20, 40]
     last_err = None
     for i, t in enumerate(timeouts, start=1):
         try:
-            raw = _http_get_latest(timeout_s=t)
-            return pick_source(raw)
+            return _http_get_latest(timeout_s=t)
         except requests.exceptions.ReadTimeout as e:
             last_err = e
             time.sleep(0.8 * i)
     raise last_err or requests.exceptions.ReadTimeout("n8n webhook timeout")
+
+# ---------------------------
+# CSV → DataFrame
+# ---------------------------
+def parse_wide_csv(csv_text: str) -> pd.DataFrame:
+    df = pd.read_csv(io.StringIO(csv_text))
+    if "variable" not in df.columns:
+        raise ValueError("CSVに 'variable' 列がありません")
+    df = df.set_index("variable")
+    # 日付列を時系列順に
+    cols = []
+    for c in df.columns:
+        try:
+            cols.append((pd.to_datetime(c), c))
+        except Exception:
+            cols.append((None, c))
+    # 日付として解釈できた列のみソートして先に、非日付は末尾
+    date_cols = sorted([c for d, c in cols if d is not None])
+    other_cols = [c for d, c in cols if d is None]
+    df = df[date_cols + other_cols]
+    # 数値化
+    for c in date_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+# ---------------------------
+# 直近7日要約の算出（facts + channels）
+# ---------------------------
+def last_n(series: pd.Series, n=7):
+    # 後ろからn件の非NaN
+    vals = series.dropna().iloc[-n:]
+    return vals
+
+def safe_median(series: pd.Series, n=7):
+    vals = last_n(series, n)
+    return float(vals.median()) if len(vals) else None
+
+def safe_sum(series: pd.Series, n=7):
+    vals = last_n(series, n)
+    return float(vals.sum()) if len(vals) else 0.0
+
+def build_features(df: pd.DataFrame, meta: dict):
+    # meta から期間
+    ads_min = pd.to_datetime(meta.get("adsMinDate"))
+    ads_max = pd.to_datetime(meta.get("adsMaxDate"))
+    if pd.isna(ads_max):
+        # DataFrameの最後の日付列から推定
+        try:
+            ads_max = pd.to_datetime([c for c in df.columns if c[:4].isdigit()][-1])
+        except Exception:
+            ads_max = pd.Timestamp.today().normalize()
+    target_date = (ads_max + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    month_start = ads_max.replace(day=1).strftime("%Y-%m-%d")
+    month_end = (ads_max + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d")
+
+    # 全体コスト系列
+    cost_all = df.loc["コスト_ALL"].dropna()
+    # MTD（今月分合計）
+    m_mask = (pd.to_datetime(cost_all.index) >= pd.to_datetime(month_start)) & \
+             (pd.to_datetime(cost_all.index) <= ads_max)
+    mtd_spend = float(cost_all[m_mask].sum()) if len(cost_all[m_mask]) else 0.0
+
+    # 参照候補
+    yesterday_total = float(cost_all.iloc[-1]) if len(cost_all) else 0.0
+    avg_last3 = float(last_n(cost_all, 3).mean()) if len(last_n(cost_all, 3)) else 0.0
+    median_last7 = float(last_n(cost_all, 7).median()) if len(last_n(cost_all, 7)) else 0.0
+
+    channels = {}
+    for key in ["IGFB","Google","YT","Tik"]:
+        def row(name):
+            rname = f"{name}_{key}"
+            return df.loc[rname] if rname in df.index else pd.Series(dtype=float)
+        channels[key] = {
+            "last7": {
+                "median_CPA": safe_median(row("CPA")),
+                "median_CVR": safe_median(row("CVR")),
+                "median_CPC": safe_median(row("CPC")),
+                "clicks_sum": int(round(safe_sum(row("クリック数")))),
+                "cv_sum":     int(round(safe_sum(row("CV")))),
+                "cost_sum":   float(round(safe_sum(row("コスト")), 3)),
+                "days_used":  int(last_n(row("コスト")).count())
+            }
+        }
+
+    features = {
+        "facts": {
+            "target_date": target_date,
+            "yesterday_date": ads_max.strftime("%Y-%m-%d"),
+            "month_start": month_start,
+            "month_end": month_end,
+            "mtd_spend": round(mtd_spend, 3),
+            "baseline_today": 0,
+            "candidates": {
+                "baseline_today": 0,
+                "yesterday_total": round(yesterday_total, 3),
+                "avg_last3": round(avg_last3, 3),
+                "median_last7": round(median_last7, 3)
+            }
+        },
+        "channels": channels
+    }
+    return features
 
 # ---------------------------
 # LLM（OpenAI / gpt-5）
@@ -51,8 +144,8 @@ def fetch_latest_manual(force: bool = False):
 BASE_INSTRUCTIONS = """あなたは広告予算配分の最適化アシスタントです。出力は厳密なJSONオブジェクトのみで返してください（余分な文章・コードフェンス不可）。
 
 【目的】
-- 月予算と4媒体（IGFB / Google / YT / Tik）の実績を踏まえ、成約単価（CPA）最適化の観点で「本日の総投資額」と「媒体別配分」を決定する。
-- 月予算は使い切り必須ではない（効率悪化時は抑制可）。
+- 直近指標（last7中央値や合計）を踏まえ、CPA最適化の観点で「本日の総投資額」と「媒体別配分」を決定する。
+- 月予算は未提供。総額は直近の水準（yesterday_total/avg_last3/median_last7等）を参照して提案してよい（抑制も可）。
 
 【前提】
 - 媒体ラベルは IGFB / Google / YT / Tik の4つのみ。
@@ -95,11 +188,11 @@ BASE_INSTRUCTIONS = """あなたは広告予算配分の最適化アシスタン
   }
 }
 
-【入力JSON】
+【入力（要約JSON）】
 """
 
-def build_prompt(src: dict) -> str:
-    return BASE_INSTRUCTIONS + json.dumps(src, ensure_ascii=False, separators=(",", ":"))
+def build_llm_input(features: dict) -> str:
+    return BASE_INSTRUCTIONS + json.dumps(features, ensure_ascii=False, separators=(",", ":"))
 
 def call_openai_chat(prompt: str) -> str:
     api_key = st.secrets["OPENAI_API_KEY"]
@@ -130,14 +223,12 @@ def strip_code_fence(s: str) -> str:
     return s.strip("` \n\r\t")
 
 def enforce_constraints(obj: dict) -> dict:
-    medias = ["IGFB", "Google", "YT", "Tik"]
+    medias = ["IGFB","Google","YT","Tik"]
     total = max(0, int(obj.get("today_total_spend", 0)))
     alloc = obj.get("allocation", {}) or {}
     for m in medias:
-        if m not in alloc:
-            alloc[m] = {"share": 0, "amount": 0}
+        if m not in alloc: alloc[m] = {"share": 0, "amount": 0}
         alloc[m]["share"] = round(float(alloc[m].get("share", 0) or 0), 2)
-    # share合計=1.00補正
     ssum = round(sum(alloc[m]["share"] for m in medias), 2)
     if ssum == 0 and total > 0:
         for m in medias: alloc[m]["share"] = 0.25
@@ -146,7 +237,6 @@ def enforce_constraints(obj: dict) -> dict:
     if abs(diff) >= 0.01:
         maxm = max(medias, key=lambda m: alloc[m]["share"])
         alloc[maxm]["share"] = round(alloc[maxm]["share"] + diff, 2)
-    # amount整合
     amts = [int(round(total * alloc[m]["share"])) for m in medias]
     adiff = total - sum(amts)
     if adiff != 0:
@@ -161,55 +251,72 @@ def enforce_constraints(obj: dict) -> dict:
 # ---------------------------
 # UI
 # ---------------------------
-st.title("AdAI 配分ビュー（手動取得 → 推論）")
+st.title("AdAI 配分ビュー（手動取得 → 要約 → gpt-5）")
 
 with st.expander("手順", expanded=True):
-    st.markdown("1) **データ取得** を押して n8n から最新JSONを取得\n2) 必要なら内容を確認\n3) **推論を実行** で gpt-5 による最終配分を生成")
+    st.markdown("1) **データ取得**: n8n から CSV（wide）を取得 → DataFrame化\n"
+                "2) **要約生成**: 直近7日の中央値/合計などを自動算出（facts/channels）\n"
+                "3) **推論を実行**: gpt-5 へ要約JSONを渡し、最終配分JSONを生成")
 
-cols = st.columns([1,1,4])
-with cols[0]:
+c1, c2, c3 = st.columns([1,1,3])
+
+with c1:
     if st.button("データ取得", type="primary"):
         with st.spinner("n8n から取得中…"):
             try:
-                st.session_state.src = fetch_latest_manual(force=False)
-                st.session_state.result = None
-                st.success("取得成功")
-            except requests.exceptions.ReadTimeout:
-                st.error("n8n `/webhook/latest` がタイムアウトしました。")
-            except requests.exceptions.HTTPError as e:
-                st.error(f"HTTPエラー: {e}")
+                raw = fetch_latest_manual(False)
+                st.session_state.raw = raw
+                csv_text = (raw.get("csv", {}) or {}).get("wide", "")
+                meta = raw.get("meta", {}) or {}
+                if not csv_text:
+                    st.error("csv.wide が空です")
+                else:
+                    df = parse_wide_csv(csv_text)
+                    st.session_state.df = df
+                    st.session_state.features = build_features(df, meta)
+                    st.session_state.result = None
+                    st.success("取得・要約成功")
             except Exception as e:
                 st.error(f"取得に失敗: {e}")
-with cols[1]:
+
+with c2:
     if st.button("再取得（強制）"):
-        with st.spinner("キャッシュを無視して再取得…"):
+        with st.spinner("キャッシュ無視で再取得…"):
             try:
-                st.session_state.src = fetch_latest_manual(force=True)
+                raw = fetch_latest_manual(True)
+                st.session_state.raw = raw
+                csv_text = (raw.get("csv", {}) or {}).get("wide", "")
+                meta = raw.get("meta", {}) or {}
+                df = parse_wide_csv(csv_text)
+                st.session_state.df = df
+                st.session_state.features = build_features(df, meta)
                 st.session_state.result = None
-                st.success("再取得成功")
+                st.success("再取得・要約成功")
             except Exception as e:
                 st.error(f"再取得に失敗: {e}")
 
-# 取得結果のプレビュー
-src = st.session_state.src
-if src:
-    with st.expander("Raw（n8n返却JSONプレビュー）", expanded=False):
-        st.code(json.dumps(src, ensure_ascii=False, indent=2))
+# プレビュー
+if st.session_state.df is not None:
+    st.subheader("CSVプレビュー（先頭数行）")
+    st.dataframe(st.session_state.df.iloc[:10, -7:], use_container_width=True)
+    st.subheader("要約（LLM入力）")
+    st.code(json.dumps(st.session_state.features, ensure_ascii=False, indent=2))
 else:
-    st.info("まだデータを取得していません。上の **データ取得** ボタンを押してください。")
+    st.info("まだデータ未取得です。**データ取得** を押してください。")
 
+# 推論
 st.markdown("### 推論（OpenAI: gpt-5）")
 if "OPENAI_API_KEY" not in st.secrets:
     st.warning("Secrets に OPENAI_API_KEY を設定してください。")
 else:
-    disabled = (src is None)
+    disabled = st.session_state.features is None
     if st.button("推論を実行", disabled=disabled):
         if disabled:
             st.warning("先にデータ取得を行ってください。")
         else:
             with st.spinner("gpt-5 で推論中…"):
                 try:
-                    prompt = BASE_INSTRUCTIONS + json.dumps(src, ensure_ascii=False, separators=(",", ":"))
+                    prompt = build_llm_input(st.session_state.features)
                     out = call_openai_chat(prompt)
                     out = strip_code_fence(out)
                     result = json.loads(out)
@@ -224,21 +331,20 @@ else:
                 except Exception as e:
                     st.error(f"推論に失敗: {e}")
 
-# 推論結果の表示
+# 結果表示
 res = st.session_state.result
 if res:
-    td = (src.get("facts") or {}).get("target_date") or res.get("report", {}).get("target_date", "")
+    td = res.get("report", {}).get("target_date") or st.session_state.features["facts"]["target_date"]
     st.subheader(f"本日の配分（{td}）")
     st.metric("総額", f"¥{int(res.get('today_total_spend', 0)):,}")
-
     alloc = res.get("allocation", {})
-    df = pd.DataFrame([
+    df_view = pd.DataFrame([
         {"media":"IGFB",  "share(%)": round(alloc["IGFB"]["share"]*100,1),  "amount(¥)": alloc["IGFB"]["amount"]},
         {"media":"Google","share(%)": round(alloc["Google"]["share"]*100,1),"amount(¥)": alloc["Google"]["amount"]},
         {"media":"YT",    "share(%)": round(alloc["YT"]["share"]*100,   1),"amount(¥)": alloc["YT"]["amount"]},
         {"media":"Tik",   "share(%)": round(alloc["Tik"]["share"]*100,  1),"amount(¥)": alloc["Tik"]["amount"]},
     ])
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df_view, use_container_width=True)
 
     if res.get("reasoning_points"):
         st.markdown("#### 判断ポイント")
@@ -253,4 +359,4 @@ if res:
                        file_name="allocation_result.json",
                        mime="application/json")
 
-st.caption("※ 初期表示ではWebhookへアクセスしません。必要時のみ手動取得 → 推論。")
+st.caption("※ CSV（wide）から必要指標をPythonで要約→gpt-5に渡して配分JSONを生成します。")
