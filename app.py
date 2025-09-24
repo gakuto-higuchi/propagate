@@ -1,22 +1,21 @@
 import io, json, time
-from datetime import datetime, timedelta
 import requests, pandas as pd, streamlit as st
 
-st.set_page_config(page_title="AdAI 配分ビュー（CSV→要約→gpt-5）", layout="wide")
+st.set_page_config(page_title="AdAI 配分ビュー（CSV/JSON→要約→gpt-5）", layout="wide")
 
 # ---------------------------
 # セッション状態
 # ---------------------------
-if "raw" not in st.session_state:      st.session_state.raw = None     # n8n生JSON
-if "df" not in st.session_state:       st.session_state.df = None      # wide DataFrame
-if "features" not in st.session_state: st.session_state.features = None# LLM入力の要約JSON
-if "result" not in st.session_state:   st.session_state.result = None  # LLMの結果JSON
+if "raw" not in st.session_state:      st.session_state.raw = None
+if "df" not in st.session_state:       st.session_state.df = None
+if "features" not in st.session_state: st.session_state.features = None
+if "result" not in st.session_state:   st.session_state.result = None
 
 # ---------------------------
-# 取得（手動のみ / Bearer無し。BasicはSecretsがあれば自動使用）
+# n8n取得（手動のみ）
 # ---------------------------
 def _http_get_latest(timeout_s: int = 20):
-    url = st.secrets["N8N_JSON_URL"]  # 例: https://<your-n8n>/webhook/latest
+    url = st.secrets["N8N_JSON_URL"]
     auth = None
     if "N8N_BASIC_USER" in st.secrets and "N8N_BASIC_PASS" in st.secrets:
         auth = (st.secrets["N8N_BASIC_USER"], st.secrets["N8N_BASIC_PASS"])
@@ -38,7 +37,10 @@ def fetch_latest_manual(force: bool = False):
     raise last_err or requests.exceptions.ReadTimeout("n8n webhook timeout")
 
 # ---------------------------
-# CSV → DataFrame
+# 入力正規化：n8nの返却を features/df に揃える
+#   Case A) {"csv":{"wide": "<csv>"}, "meta": {...}}
+#   Case B) [{"facts": {...}}]  or {"facts": {...}}
+#      - Bでは facts.channels を取り出して top-level "channels" に分離
 # ---------------------------
 def parse_wide_csv(csv_text: str) -> pd.DataFrame:
     df = pd.read_csv(io.StringIO(csv_text))
@@ -46,7 +48,7 @@ def parse_wide_csv(csv_text: str) -> pd.DataFrame:
         raise ValueError("CSVに 'variable' 列がありません")
     df = df.set_index("variable")
 
-    # 日付列を時系列順に並べ替え（非日付は末尾）
+    # 日付列を時系列順に、非日付は末尾へ
     cols = []
     for c in df.columns:
         try:
@@ -56,15 +58,10 @@ def parse_wide_csv(csv_text: str) -> pd.DataFrame:
     date_cols = sorted([c for d, c in cols if d is not None])
     other_cols = [c for d, c in cols if d is None]
     df = df[date_cols + other_cols]
-
-    # 数値化（NaNはそのまま）
     for c in date_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-# ---------------------------
-# 直近7日要約の算出（facts + channels）
-# ---------------------------
 def last_n(series: pd.Series, n=7):
     return series.dropna().iloc[-n:]
 
@@ -76,11 +73,10 @@ def safe_sum(series: pd.Series, n=7):
     vals = last_n(series, n)
     return float(vals.sum()) if len(vals) else 0.0
 
-def build_features(df: pd.DataFrame, meta: dict):
-    ads_min = pd.to_datetime(meta.get("adsMinDate")) if meta else None
-    ads_max = pd.to_datetime(meta.get("adsMaxDate")) if meta else None
+def build_features_from_csv(df: pd.DataFrame, meta: dict):
+    # 期間推定
+    ads_max = pd.to_datetime((meta or {}).get("adsMaxDate")) if meta else None
     if ads_max is None or pd.isna(ads_max):
-        # DataFrameの最後の日付列から推定
         try:
             date_like = [c for c in df.columns if str(c)[:4].isdigit()]
             ads_max = pd.to_datetime(date_like[-1])
@@ -92,12 +88,8 @@ def build_features(df: pd.DataFrame, meta: dict):
     month_end = (ads_max + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d")
 
     # 全体コスト系列
-    if "コスト_ALL" in df.index:
-        cost_all = df.loc["コスト_ALL"].dropna()
-    else:
-        cost_all = pd.Series(dtype=float)
+    cost_all = df.loc["コスト_ALL"].dropna() if "コスト_ALL" in df.index else pd.Series(dtype=float)
 
-    # MTD（今月分合計）
     if len(cost_all):
         idx_as_dt = pd.to_datetime(cost_all.index)
         m_mask = (idx_as_dt >= pd.to_datetime(month_start)) & (idx_as_dt <= ads_max)
@@ -106,12 +98,8 @@ def build_features(df: pd.DataFrame, meta: dict):
         avg_last3 = float(last_n(cost_all, 3).mean()) if len(last_n(cost_all, 3)) else 0.0
         median_last7 = float(last_n(cost_all, 7).median()) if len(last_n(cost_all, 7)) else 0.0
     else:
-        mtd_spend = 0.0
-        yesterday_total = 0.0
-        avg_last3 = 0.0
-        median_last7 = 0.0
+        mtd_spend = yesterday_total = avg_last3 = median_last7 = 0.0
 
-    # 媒体別 last7 要約
     channels = {}
     for key in ["IGFB", "Google", "YT", "Tik"]:
         def row(name):
@@ -126,10 +114,11 @@ def build_features(df: pd.DataFrame, meta: dict):
                 "cv_sum":     int(round(safe_sum(row("CV")))),
                 "cost_sum":   float(round(safe_sum(row("コスト")), 3)),
                 "days_used":  int(last_n(row("コスト")).count())
-            }
+            },
+            # CSVには yesterday_spend/confidence がないので省略
         }
 
-    features = {
+    return {
         "facts": {
             "target_date": target_date,
             "yesterday_date": ads_max.strftime("%Y-%m-%d"),
@@ -146,16 +135,63 @@ def build_features(df: pd.DataFrame, meta: dict):
         },
         "channels": channels
     }
-    return features
+
+def build_features_from_factsish(obj):
+    """obj が {"facts": {...}} or [{"facts": {...}}] の形を features に揃える"""
+    # 配列なら先頭を使う
+    if isinstance(obj, list):
+        if not obj:
+            raise ValueError("空リストを受信しました")
+        obj = obj[0]
+
+    if not isinstance(obj, dict) or "facts" not in obj:
+        raise ValueError("facts を含むオブジェクトではありません")
+
+    facts = dict(obj["facts"])  # copy
+    # channels の場所：facts.channels or obj.channels
+    channels = {}
+    if "channels" in facts and isinstance(facts["channels"], dict):
+        channels = facts["channels"]
+        facts = {k: v for k, v in facts.items() if k != "channels"}
+    elif "channels" in obj and isinstance(obj["channels"], dict):
+        channels = obj["channels"]
+
+    # 期待構造へ
+    return {"facts": facts, "channels": channels}
+
+def coerce_features_and_df(raw):
+    """n8nの返却を判定して features / df を返す"""
+    df = None
+    features = None
+
+    # Case A: CSV型
+    if isinstance(raw, dict) and isinstance(raw.get("csv"), dict) and "wide" in raw["csv"]:
+        csv_text = raw["csv"]["wide"]
+        meta = raw.get("meta", {}) or {}
+        if not csv_text:
+            raise ValueError("csv.wide が空です")
+        df = parse_wide_csv(csv_text)
+        features = build_features_from_csv(df, meta)
+        return features, df
+
+    # Case B: facts型（配列 or 単体）
+    try:
+        features = build_features_from_factsish(raw)
+        return features, df  # dfは無し
+    except Exception:
+        pass
+
+    # どれにも当てはまらない
+    raise ValueError("未対応のペイロード形式です")
 
 # ---------------------------
-# LLM（OpenAI / gpt-5）: SDKがあれば使い、無ければHTTPにフォールバック
+# LLM（OpenAI / gpt-5）: SDK→HTTPフォールバック
 # ---------------------------
 BASE_INSTRUCTIONS = """あなたは広告予算配分の最適化アシスタントです。出力は厳密なJSONオブジェクトのみで返してください（余分な文章・コードフェンス不可）。
 
 【目的】
-- 直近指標（last7中央値や合計）を踏まえ、CPA最適化の観点で「本日の総投資額」と「媒体別配分」を決定する。
-- 月予算は未提供。総額は直近の水準（yesterday_total/avg_last3/median_last7等）を参照して提案してよい（抑制も可）。
+- 直近指標（last7中央値や合計）など入力の facts/channels を踏まえ、CPA最適化の観点で「本日の総投資額」と「媒体別配分」を決定する。
+- 月予算情報（あれば）や candidates（yesterday_total/avg_last3/median_last7等）は参照（抑制も可）。
 
 【前提】
 - 媒体ラベルは IGFB / Google / YT / Tik の4つのみ。
@@ -198,14 +234,14 @@ BASE_INSTRUCTIONS = """あなたは広告予算配分の最適化アシスタン
   }
 }
 
-【入力（要約JSON）】
+【入力（features: facts/channels）】
 """
 
 def build_llm_input(features: dict) -> str:
     return BASE_INSTRUCTIONS + json.dumps(features, ensure_ascii=False, separators=(",", ":"))
 
 def run_openai_chat(prompt: str) -> dict:
-    """まずSDK（json固定）を試し、無ければHTTPにフォールバック。返り値は必ず dict"""
+    """SDK（json固定）→ 無ければHTTPにフォールバック"""
     api_key = st.secrets["OPENAI_API_KEY"]
     model = st.secrets.get("OPENAI_MODEL", "gpt-5")
     base_url = st.secrets.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -215,50 +251,49 @@ def run_openai_chat(prompt: str) -> dict:
         {"role": "user", "content": prompt},
     ]
 
-    # 1) SDK（推奨）— あればこれで JSON を強制
+    # 1) SDK
     try:
-        from openai import OpenAI  # 遅延import（未インストールでも起動し続ける）
+        from openai import OpenAI
         client = OpenAI(api_key=api_key, base_url=base_url)
         resp = client.chat.completions.create(
             model=model,
-            response_format={"type": "json_object"},  # JSON固定
+            response_format={"type": "json_object"},
             temperature=0.2,
             messages=messages,
         )
         return json.loads(resp.choices[0].message.content)
-
     except ModuleNotFoundError:
-        # 2) HTTPフォールバック— requestsで公式エンドポイントに投げる
-        body = {
-            "model": model,
-            "response_format": {"type": "json_object"},
-            "temperature": 0.2,
-            "messages": messages,
-        }
-        r = requests.post(
-            f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=body, timeout=120
-        )
-        r.raise_for_status()
-        data = r.json()
-        return json.loads(data["choices"][0]["message"]["content"])
+        pass
+
+    # 2) HTTPフォールバック
+    body = {
+        "model": model,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+        "messages": messages,
+    }
+    r = requests.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=body, timeout=120
+    )
+    r.raise_for_status()
+    data = r.json()
+    return json.loads(data["choices"][0]["message"]["content"])
 
 # ---------------------------
-# 配分の整合補正
+# 最終整合（share/amount/total）
 # ---------------------------
 def enforce_constraints(obj: dict) -> dict:
     medias = ["IGFB", "Google", "YT", "Tik"]
     total = max(0, int(obj.get("today_total_spend", 0)))
     alloc = obj.get("allocation", {}) or {}
 
-    # 欠落キーの補完＋share丸め
     for m in medias:
         if m not in alloc:
             alloc[m] = {"share": 0, "amount": 0}
         alloc[m]["share"] = round(float(alloc[m].get("share", 0) or 0), 2)
 
-    # share合計=1.00 補正（最大share媒体に差分付与）
     ssum = round(sum(alloc[m]["share"] for m in medias), 2)
     if ssum == 0 and total > 0:
         for m in medias:
@@ -269,7 +304,6 @@ def enforce_constraints(obj: dict) -> dict:
         maxm = max(medias, key=lambda m: alloc[m]["share"])
         alloc[maxm]["share"] = round(alloc[maxm]["share"] + diff, 2)
 
-    # amount整合（合計=total に厳密一致）
     amts = [int(round(total * alloc[m]["share"])) for m in medias]
     adiff = total - sum(amts)
     if adiff != 0:
@@ -285,13 +319,13 @@ def enforce_constraints(obj: dict) -> dict:
 # ---------------------------
 # UI
 # ---------------------------
-st.title("AdAI 配分ビュー（手動取得 → 要約 → gpt-5）")
+st.title("AdAI 配分ビュー（手動取得 → 要約/統合 → gpt-5）")
 
 with st.expander("手順", expanded=True):
     st.markdown(
-        "1) **データ取得**: n8n から CSV（wide）を取得 → DataFrame化\n"
-        "2) **要約生成**: 直近7日の中央値/合計などを自動算出（facts/channels）\n"
-        "3) **推論を実行**: gpt-5 へ要約JSONを渡し、最終配分JSONを生成"
+        "1) **データ取得**: n8n から CSV または JSON（facts型）を取得\n"
+        "2) **統合**: CSVなら要約を生成、facts型ならそのまま正規化（features）\n"
+        "3) **推論**: gpt-5 へ features を渡し、最終配分JSONを生成"
     )
 
 c1, c2, _ = st.columns([1, 1, 3])
@@ -302,16 +336,11 @@ with c1:
             try:
                 raw = fetch_latest_manual(False)
                 st.session_state.raw = raw
-                csv_text = (raw.get("csv", {}) or {}).get("wide", "")
-                meta = raw.get("meta", {}) or {}
-                if not csv_text:
-                    st.error("csv.wide が空です")
-                else:
-                    df = parse_wide_csv(csv_text)
-                    st.session_state.df = df
-                    st.session_state.features = build_features(df, meta)
-                    st.session_state.result = None
-                    st.success("取得・要約成功")
+                features, df = coerce_features_and_df(raw)
+                st.session_state.df = df
+                st.session_state.features = features
+                st.session_state.result = None
+                st.success("取得・正規化成功")
             except Exception as e:
                 st.error(f"取得に失敗: {e}")
 
@@ -321,29 +350,24 @@ with c2:
             try:
                 raw = fetch_latest_manual(True)
                 st.session_state.raw = raw
-                csv_text = (raw.get("csv", {}) or {}).get("wide", "")
-                meta = raw.get("meta", {}) or {}
-                if not csv_text:
-                    st.error("csv.wide が空です")
-                else:
-                    df = parse_wide_csv(csv_text)
-                    st.session_state.df = df
-                    st.session_state.features = build_features(df, meta)
-                    st.session_state.result = None
-                    st.success("再取得・要約成功")
+                features, df = coerce_features_and_df(raw)
+                st.session_state.df = df
+                st.session_state.features = features
+                st.session_state.result = None
+                st.success("再取得・正規化成功")
             except Exception as e:
                 st.error(f"再取得に失敗: {e}")
 
 # プレビュー
 if st.session_state.df is not None:
     st.subheader("CSVプレビュー（先頭数行 × 直近7日）")
-    # 末尾から最大7列だけ（列が少ないケースもOK）
     cols = list(st.session_state.df.columns)
     k = min(7, len(cols))
     preview_cols = cols[-k:] if k > 0 else []
     st.dataframe(st.session_state.df[preview_cols].head(10), use_container_width=True)
 
-    st.subheader("要約（LLM入力）")
+if st.session_state.features is not None:
+    st.subheader("features（LLM入力）")
     st.code(json.dumps(st.session_state.features, ensure_ascii=False, indent=2))
 else:
     st.info("まだデータ未取得です。**データ取得** を押してください。")
@@ -361,8 +385,8 @@ else:
             with st.spinner("gpt-5 で推論中…"):
                 try:
                     prompt = build_llm_input(st.session_state.features)
-                    result = run_openai_chat(prompt)          # SDK→HTTPの順で実行
-                    result = enforce_constraints(result)      # share/amount/total を最終整合
+                    result = run_openai_chat(prompt)
+                    result = enforce_constraints(result)
                     st.session_state.result = result
                     st.success("推論成功")
                 except requests.exceptions.HTTPError as e:
@@ -373,16 +397,17 @@ else:
 # 結果表示
 res = st.session_state.result
 if res:
-    td = res.get("report", {}).get("target_date") or st.session_state.features["facts"]["target_date"]
+    td = res.get("report", {}).get("target_date") \
+         or (st.session_state.features.get("facts", {}).get("target_date") if st.session_state.features else "")
     st.subheader(f"本日の配分（{td}）")
     st.metric("総額", f"¥{int(res.get('today_total_spend', 0)):,}")
 
     alloc = res.get("allocation", {})
     df_view = pd.DataFrame([
-        {"media": "IGFB",   "share(%)": round(alloc["IGFB"]["share"] * 100, 1),   "amount(¥)": alloc["IGFB"]["amount"]},
-        {"media": "Google", "share(%)": round(alloc["Google"]["share"] * 100, 1), "amount(¥)": alloc["Google"]["amount"]},
-        {"media": "YT",     "share(%)": round(alloc["YT"]["share"] * 100, 1),     "amount(¥)": alloc["YT"]["amount"]},
-        {"media": "Tik",    "share(%)": round(alloc["Tik"]["share"] * 100, 1),    "amount(¥)": alloc["Tik"]["amount"]},
+        {"media": "IGFB",   "share(%)": round(alloc.get("IGFB",{}).get("share",0)*100, 1),   "amount(¥)": alloc.get("IGFB",{}).get("amount",0)},
+        {"media": "Google", "share(%)": round(alloc.get("Google",{}).get("share",0)*100, 1), "amount(¥)": alloc.get("Google",{}).get("amount",0)},
+        {"media": "YT",     "share(%)": round(alloc.get("YT",{}).get("share",0)*100, 1),     "amount(¥)": alloc.get("YT",{}).get("amount",0)},
+        {"media": "Tik",    "share(%)": round(alloc.get("Tik",{}).get("share",0)*100, 1),    "amount(¥)": alloc.get("Tik",{}).get("amount",0)},
     ])
     st.dataframe(df_view, use_container_width=True)
 
@@ -402,4 +427,4 @@ if res:
         mime="application/json"
     )
 
-st.caption("※ 初期表示ではWebHookにアクセスしません。必要時のみ「データ取得」→要約→gpt-5→整合。")
+st.caption("※ CSV型／facts型どちらのペイロードにも対応。初期表示では外部アクセスなし。")
