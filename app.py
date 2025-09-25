@@ -2,8 +2,10 @@
 # AdAI 配分ビュー（facts + CSV 必須 / プロンプトA/B/Cを完全手動で比較）
 # - 初期表示では外部アクセスしない
 # - n8nの返却は「facts と csv.wide の両方」を必須
-# - A/B/C それぞれで model / temperature / 他パラメータ / system&userプロンプト / CSV含有&期間 を独立設定
-# - 各スロットの「最終投入プロンプト」「LLM生出力」「整合後JSON」を可視化し、横比較
+# - A/B/C それぞれで model / temperature / 他パラメータ / system&userプロンプト /
+#   CSV同梱モード（全期間 or 最新N日）を独立設定
+# - 各スロットの「最終投入プロンプト」「LLM生出力」「整合後JSON」を可視化、横比較
+# - 画面縮小でも崩れにくいUI（CSS注入 / タブ切替 / フォーム化 / カラム間隔）
 
 import io, json, time, math
 from datetime import datetime, timezone, timedelta, date
@@ -15,16 +17,46 @@ import requests, pandas as pd, streamlit as st
 st.set_page_config(page_title="AdAI 配分ビュー（facts+CSV必須 / A/B/C比較）", layout="wide")
 JST = timezone(timedelta(hours=9))
 
+def inject_css(compact: bool = False):
+    css = f"""
+    <style>
+    .block-container {{
+        max-width: 1400px;
+        padding-top: {'0.5rem' if compact else '1rem'};
+        padding-bottom: 2rem;
+    }}
+    pre, code {{
+        white-space: pre;
+        overflow-x: auto;
+    }}
+    [data-testid="stDataFrame"] .ag-header-cell-label {{
+        white-space: nowrap !important;
+    }}
+    .stButton>button {{
+        width: 100%;
+    }}
+    div.row-widget.stRadio > div {{
+        flex-wrap: wrap;
+        gap: .5rem 1rem;
+    }}
+    .st-expander {{
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+    }}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
 # ---------------------------
 # セッション状態
 # ---------------------------
-if "raw" not in st.session_state:      st.session_state.raw = None         # n8n返却そのまま
-if "facts" not in st.session_state:    st.session_state.facts = None
-if "csv_text" not in st.session_state: st.session_state.csv_text = None
-if "meta" not in st.session_state:     st.session_state.meta = {}
-if "df" not in st.session_state:       st.session_state.df = None
-if "features" not in st.session_state: st.session_state.features = None    # LLMへ渡すベース（facts+channels）
-if "slots" not in st.session_state:    st.session_state.slots = {}         # A/B/C 各設定・結果
+if "raw" not in st.session_state:        st.session_state.raw = None         # n8n返却そのまま
+if "facts" not in st.session_state:      st.session_state.facts = None
+if "channels" not in st.session_state:   st.session_state.channels = {}
+if "csv_text" not in st.session_state:   st.session_state.csv_text = None
+if "meta" not in st.session_state:       st.session_state.meta = {}
+if "df" not in st.session_state:         st.session_state.df = None
+if "slots" not in st.session_state:      st.session_state.slots = {}         # A/B/C 各設定・結果
 
 SLOT_IDS = ["A", "B", "C"]
 
@@ -83,23 +115,26 @@ def parse_wide_csv(csv_text: str) -> pd.DataFrame:
 def coerce_require_facts_and_csv(raw):
     """facts と csv.wide を必須で抽出。無ければエラー。"""
     facts = None
+    channels = {}
     csv_text = None
     meta = {}
 
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, dict):
-                if facts is None and "facts" in item:
+                if facts is None and "facts" in item and isinstance(item["facts"], dict):
                     facts = item["facts"]
                 if csv_text is None and isinstance(item.get("csv"), dict) and "wide" in item["csv"]:
                     csv_text = item["csv"]["wide"]
                     meta = item.get("meta", {}) or meta
     elif isinstance(raw, dict):
-        if "facts" in raw:
+        if "facts" in raw and isinstance(raw["facts"], dict):
             facts = raw["facts"]
         if isinstance(raw.get("csv"), dict) and "wide" in raw["csv"]:
             csv_text = raw["csv"]["wide"]
             meta = raw.get("meta", {}) or meta
+        if "channels" in raw and isinstance(raw["channels"], dict):
+            channels = raw["channels"]
     else:
         raise ValueError("未対応のペイロード形式です（list/dict 以外）")
 
@@ -108,14 +143,11 @@ def coerce_require_facts_and_csv(raw):
     if not csv_text or not isinstance(csv_text, str):
         raise ValueError("csv.wide が見つかりませんでした（必須）")
 
-    # channelsの所在（facts内 or トップ）に対応
-    channels = {}
+    # facts内channelsを優先的に採取
     if "channels" in facts and isinstance(facts["channels"], dict):
         channels = facts["channels"]
-        facts = {k: v for k, v in facts.items() if k != "channels"}
-    elif isinstance(raw, dict) and "channels" in raw and isinstance(raw["channels"], dict):
-        channels = raw["channels"]
-
+        # features整形時にfactsからは除外したい場合はここで除外しても良い
+        # 今回は保持したまま渡してもOK（LLM側はfacts/channels両方受け取る）
     return facts, channels, csv_text, meta
 
 # ---------------------------
@@ -123,13 +155,11 @@ def coerce_require_facts_and_csv(raw):
 # ---------------------------
 def df_latest_days(df: pd.DataFrame, n_days: int) -> pd.DataFrame:
     cols = list(df.columns)
-    # 末尾から n_days の日付列（非日付は除く）
     date_cols = [c for c in cols if str(c)[:4].isdigit()]
     use_cols = date_cols[-n_days:] if n_days > 0 else date_cols
     return df[use_cols]
 
 def df_to_csv_text(df_slice: pd.DataFrame) -> str:
-    # indexを 'variable' 列に戻してCSV文字列化
     out = df_slice.copy()
     out.insert(0, "variable", out.index)
     return out.to_csv(index=False)
@@ -151,38 +181,38 @@ BASE_INSTRUCTIONS = """あなたは広告予算配分の最適化アシスタン
 - amount 合計は today_total_spend に厳密一致（丸め差は最大share媒体のamountで吸収）。
 
 【出力スキーマ（厳密）】
-{
+{{
   "today_total_spend": <int>,
-  "allocation": {
-    "IGFB":   { "share": <number>, "amount": <int> },
-    "Google": { "share": <number>, "amount": <int> },
-    "YT":     { "share": <number>, "amount": <int> },
-    "Tik":    { "share": <number>, "amount": <int> }
-  },
+  "allocation": {{
+    "IGFB":   {{ "share": <number>, "amount": <int> }},
+    "Google": {{ "share": <number>, "amount": <int> }},
+    "YT":     {{ "share": <number>, "amount": <int> }},
+    "Tik":    {{ "share": <number>, "amount": <int> }}
+  }},
   "reasoning_points": ["…","…"],
-  "report": {
+  "report": {{
     "title": "本日の予算配分レポート",
     "target_date": "<YYYY-MM-DD>",
     "executive_summary": "一段落で要旨",
-    "pacing_decision": { "chosen_today_total": <int>, "why": "数値根拠を説明" },
-    "channel_signals": {
-      "IGFB":  { "stance": "積極/中庸/抑制", "last7": { "median_CPA": <number|null>, "median_CVR": <number|null>, "median_CPC": <number|null>, "clicks_sum": <int>, "cv_sum": <int> }, "confidence": "<low|med|high>", "why": "…" },
-      "Google":{ "stance": "積極/中庸/抑制", "last7": { "median_CPA": <number|null>, "median_CVR": <number|null>, "median_CPC": <number|null>, "clicks_sum": <int>, "cv_sum": <int> }, "confidence": "<low|med|high>", "why": "…" },
-      "YT":    { "stance": "積極/中庸/抑制", "last7": { "median_CPA": <number|null>, "median_CVR": <number|null>, "median_CPC": <number|null>, "clicks_sum": <int>, "cv_sum": <int> }, "confidence": "<low|med|high>", "why": "…" },
-      "Tik":   { "stance": "積極/中庸/抑制", "last7": { "median_CPA": <number|null>, "median_CVR": <number|null>, "median_CPC": <number|null>, "clicks_sum": <int>, "cv_sum": <int> }, "confidence": "<low|med|high>", "why": "…" }
-    },
+    "pacing_decision": {{ "chosen_today_total": <int>, "why": "数値根拠を説明" }},
+    "channel_signals": {{
+      "IGFB":  {{ "stance": "積極/中庸/抑制", "last7": {{ "median_CPA": <number|null>, "median_CVR": <number|null>, "median_CPC": <number|null>, "clicks_sum": <int>, "cv_sum": <int> }}, "confidence": "<low|med|high>", "why": "…" }},
+      "Google":{{ "stance": "積極/中庸/抑制", "last7": {{ "median_CPA": <number|null>, "median_CVR": <number|null>, "median_CPC": <number>null>, "clicks_sum": <int>, "cv_sum": <int> }}, "confidence": "<low|med|high>", "why": "…" }},
+      "YT":    {{ "stance": "積極/中庸/抑制", "last7": {{ "median_CPA": <number|null>, "median_CVR": <number|null>, "median_CPC": <number|null>, "clicks_sum": <int>, "cv_sum": <int> }}, "confidence": "<low|med|high>", "why": "…" }},
+      "Tik":   {{ "stance": "積極/中庸/抑制", "last7": {{ "median_CPA": <number|null>, "median_CVR": <number|null>, "median_CPC": <number|null>, "clicks_sum": <int>, "cv_sum": <int> }}, "confidence": "<low|med|high>", "why": "…" }}
+    }},
     "decision_flow": [
-      { "step": "総額の決定", "data_used": ["baseline_today","yesterday_total","avg_last3","median_last7"], "logic": "重み付けの考え方" },
-      { "step": "配分の決定", "data_used": ["channel_signals","ボリューム","効率の相対比較"], "logic": "シェア比の導出" },
-      { "step": "整合調整", "data_used": ["丸め誤差"], "logic": "最大share媒体で吸収" }
+      {{ "step": "総額の決定", "data_used": ["baseline_today","yesterday_total","avg_last3","median_last7"], "logic": "重み付けの考え方" }},
+      {{ "step": "配分の決定", "data_used": ["channel_signals","ボリューム","効率の相対比較"], "logic": "シェア比の導出" }},
+      {{ "step": "整合調整", "data_used": ["丸め誤差"], "logic": "最大share媒体で吸収" }}
     ],
-    "final_allocation_check": {
-      "expected_cv": { "IGFB": <number|null>, "Google": <number|null>, "YT": <number|null>, "Tik": <number|null> },
+    "final_allocation_check": {{
+      "expected_cv": {{ "IGFB": <number|null>, "Google": <number|null>, "YT": <number|null>, "Tik": <number|null> }},
       "notes": "CPA>0 時は expected_cv=金額/median_CPA。欠損時は null。"
-    },
-    "risks_and_actions": { "risks": ["…"], "next_actions": ["…"] }
-  }
-}
+    }},
+    "risks_and_actions": {{ "risks": ["…"], "next_actions": ["…"] }}
+  }}
+}}
 
 【入力（features: facts/channels）】
 """
@@ -194,18 +224,17 @@ def build_features_for_prompt(facts: dict, channels: dict, override_budget: floa
         f["month_budget"] = float(override_budget)
     if override_target is not None:
         f["target_date"] = override_target.strftime("%Y-%m-%d")
-    return {"facts": f, "channels": channels}
+    return {"facts": f, "channels": channels or {}}
 
-def make_final_prompt_text(system_text: str, user_text: str, features_obj: dict, include_csv: bool, csv_snippet: str|None):
+def make_final_prompt_text(system_text: str, user_text: str, features_obj: dict,
+                           include_csv: bool, csv_snippet: str|None, csv_label: str):
     base = BASE_INSTRUCTIONS + json.dumps(features_obj, ensure_ascii=False, separators=(",", ":"))
     if include_csv and csv_snippet:
-        base += "\n\n【CSV（最新N日）】\n" + csv_snippet
-    # user_text を最後に付与（追加の指示や評価軸の変更など）
+        base += f"\n\n【CSV（{csv_label}）】\n" + csv_snippet
     if user_text and user_text.strip():
         base += "\n\n【追加指示】\n" + user_text.strip()
-    # system_text は OpenAIの system に渡す。ここでは返却としても見えるようにしておく
     visible_prompt = f"<<SYSTEM>>\n{system_text.strip()}\n\n<<USER>>\n{base}"
-    return base, visible_prompt  # base: 実際にuserへ、visible: UI表示用
+    return base, visible_prompt  # 実投入 / 可視化
 
 def run_openai_chat(slot_cfg: dict, user_prompt: str) -> str:
     """SDK優先 → HTTPフォールバック。JSON文字列を返す（response_format=json_object）"""
@@ -316,6 +345,10 @@ st.sidebar.markdown("- まず「データ取得」を押して n8n から facts 
 if "OPENAI_API_KEY" not in st.secrets:
     st.sidebar.error("Secrets に OPENAI_API_KEY を設定してください。")
 
+# UI安定用CSS
+compact = st.sidebar.checkbox("コンパクト表示（余白を減らす）", value=False)
+inject_css(compact)
+
 # facts の上書き
 override_budget = st.sidebar.number_input("月予算（上書き / 任意）", min_value=0.0, step=1000.0, format="%.0f", value=0.0)
 use_override_budget = st.sidebar.checkbox("月予算の上書きを有効化", value=False)
@@ -329,7 +362,8 @@ use_override_target = st.sidebar.checkbox("対象日の上書きを有効化", v
 st.sidebar.divider()
 st.sidebar.write("**CSV同梱の既定（各スロットでも変更可）**")
 csv_default_include = st.sidebar.checkbox("CSVをプロンプトへ含める（既定）", value=True)
-csv_default_days = st.sidebar.slider("CSVの最新N日（既定）", 3, 31, 7, 1)
+csv_default_mode = st.sidebar.radio("CSVの同梱モード（既定）", ["全期間", "最新N日"], index=0, horizontal=True)
+csv_default_days = st.sidebar.slider("（最新N日が選択時）Nの値", 3, 31, 7, 1)
 
 # ---------------------------
 # 取得 / 再取得
@@ -345,12 +379,10 @@ with c1:
 
                 st.session_state.raw = raw
                 st.session_state.facts = facts
+                st.session_state.channels = channels or {}
                 st.session_state.csv_text = csv_text
                 st.session_state.meta = meta
                 st.session_state.df = df
-
-                # features（プロンプト用ベース）は上書き適用時に都度作るのでここではNone
-                st.session_state.features = None
 
                 st.success("取得成功：facts と CSV を読み込みました。")
             except Exception as e:
@@ -363,12 +395,14 @@ with c2:
                 raw = fetch_latest_manual(True)
                 facts, channels, csv_text, meta = coerce_require_facts_and_csv(raw)
                 df = parse_wide_csv(csv_text)
+
                 st.session_state.raw = raw
                 st.session_state.facts = facts
+                st.session_state.channels = channels or {}
                 st.session_state.csv_text = csv_text
                 st.session_state.meta = meta
                 st.session_state.df = df
-                st.session_state.features = None
+
                 st.success("再取得成功")
             except Exception as e:
                 st.error(f"再取得に失敗: {e}")
@@ -380,14 +414,12 @@ with c3:
 # プレビュー：CSV & facts
 # ---------------------------
 if st.session_state.df is not None:
-    st.subheader("CSVプレビュー（全期間 / 先頭10行）")
-    st.dataframe(st.session_state.df.head(10), use_container_width=True)
-
-    st.subheader("CSVプレビュー（最新7日 / 先頭10行）")
-    try:
-        st.dataframe(df_latest_days(st.session_state.df, 7).head(10), use_container_width=True)
-    except Exception:
-        st.info("最新7日抽出に失敗しましたが全体は読み込めています。")
+    st.subheader("CSVプレビュー（全期間・全行）")
+    st.dataframe(
+        st.session_state.df,
+        use_container_width=True,
+        height=700,
+    )
 
 if st.session_state.facts is not None:
     st.subheader("facts（元データ）")
@@ -408,7 +440,8 @@ def ensure_slots():
         "system": "You are an expert ads budget allocation assistant. Output valid JSON only.",
         "user": "数値根拠を明示しつつ、現実的な配分を提案してください。",
         "include_csv": csv_default_include,
-        "csv_days": csv_default_days,
+        "csv_mode": csv_default_mode,     # "全期間" or "最新N日"
+        "csv_days": csv_default_days,     # 最新N日モードのとき使用
         # 実行結果
         "final_prompt_preview": None,
         "raw_output": None,
@@ -421,44 +454,68 @@ def ensure_slots():
 ensure_slots()
 
 # ---------------------------
-# スロット編集UI
+# スロット編集UI（フォーム化 / レイアウト安定）
 # ---------------------------
-st.markdown("## Prompt Lab（A/B/C）— モデル/温度/プロンプト等を完全手動で設定")
-
 def slot_editor(sid: str):
     cfg = st.session_state.slots[sid]
     with st.expander(f"スロット {sid} の設定・実行", expanded=(sid=="A")):
-        c1, c2, c3, c4 = st.columns([1.2,1,1,1])
-        with c1:
-            cfg["model"] = st.text_input(f"[{sid}] モデル名", value=cfg["model"], key=f"{sid}_model")
-        with c2:
-            cfg["temperature"] = st.number_input(f"[{sid}] temperature", min_value=0.0, max_value=2.0, step=0.1, value=float(cfg["temperature"]), key=f"{sid}_temp")
-        with c3:
-            cfg["top_p"] = st.number_input(f"[{sid}] top_p（任意）", min_value=0.0, max_value=1.0, step=0.05, value=cfg["top_p"] if cfg["top_p"] is not None else 1.0, key=f"{sid}_top_p")
-            if math.isclose(cfg["top_p"], 1.0): cfg["top_p"] = None  # 1.0は未指定扱い
-        with c4:
-            cfg["max_tokens"] = st.number_input(f"[{sid}] max_tokens（任意）", min_value=0, step=50, value=cfg["max_tokens"] or 0, key=f"{sid}_max_tok")
-            if cfg["max_tokens"] == 0: cfg["max_tokens"] = None
+        with st.form(key=f"{sid}_form", clear_on_submit=False):
+            c1, c2, c3, c4 = st.columns([1.2,1,1,1])
+            with c1:
+                cfg["model"] = st.text_input(f"[{sid}] モデル名", value=cfg["model"], key=f"{sid}_model")
+            with c2:
+                cfg["temperature"] = st.number_input(
+                    f"[{sid}] temperature", min_value=0.0, max_value=2.0, step=0.1,
+                    value=float(cfg["temperature"]), key=f"{sid}_temp"
+                )
+            with c3:
+                top_p_val = cfg["top_p"] if cfg["top_p"] is not None else 1.0
+                top_p_val = st.number_input(
+                    f"[{sid}] top_p（任意）", min_value=0.0, max_value=1.0, step=0.05,
+                    value=top_p_val, key=f"{sid}_top_p"
+                )
+                cfg["top_p"] = None if math.isclose(top_p_val, 1.0) else float(top_p_val)
+            with c4:
+                max_tok_val = cfg["max_tokens"] or 0
+                max_tok_val = st.number_input(
+                    f"[{sid}] max_tokens（任意）", min_value=0, step=50,
+                    value=max_tok_val, key=f"{sid}_max_tok"
+                )
+                cfg["max_tokens"] = None if max_tok_val == 0 else int(max_tok_val)
 
-        c5, c6, c7 = st.columns(3)
-        with c5:
-            cfg["seed"] = st.number_input(f"[{sid}] seed（任意）", min_value=0, step=1, value=cfg["seed"] or 0, key=f"{sid}_seed")
-            if cfg["seed"] == 0: cfg["seed"] = None
-        with c6:
-            cfg["presence_penalty"] = st.number_input(f"[{sid}] presence_penalty（任意）", min_value=-2.0, max_value=2.0, step=0.1, value=cfg["presence_penalty"] if cfg["presence_penalty"] is not None else 0.0, key=f"{sid}_pp")
-            if math.isclose(cfg["presence_penalty"], 0.0): cfg["presence_penalty"] = None
-        with c7:
-            cfg["frequency_penalty"] = st.number_input(f"[{sid}] frequency_penalty（任意）", min_value=-2.0, max_value=2.0, step=0.1, value=cfg["frequency_penalty"] if cfg["frequency_penalty"] is not None else 0.0, key=f"{sid}_fp")
-            if math.isclose(cfg["frequency_penalty"], 0.0): cfg["frequency_penalty"] = None
+            c5, c6, c7 = st.columns(3)
+            with c5:
+                seed_val = cfg["seed"] or 0
+                seed_val = st.number_input(f"[{sid}] seed（任意）", min_value=0, step=1, value=seed_val, key=f"{sid}_seed")
+                cfg["seed"] = None if seed_val == 0 else int(seed_val)
+            with c6:
+                pp_val = cfg["presence_penalty"] if cfg["presence_penalty"] is not None else 0.0
+                pp_val = st.number_input(
+                    f"[{sid}] presence_penalty（任意）", min_value=-2.0, max_value=2.0, step=0.1,
+                    value=pp_val, key=f"{sid}_pp"
+                )
+                cfg["presence_penalty"] = None if math.isclose(pp_val, 0.0) else float(pp_val)
+            with c7:
+                fp_val = cfg["frequency_penalty"] if cfg["frequency_penalty"] is not None else 0.0
+                fp_val = st.number_input(
+                    f"[{sid}] frequency_penalty（任意）", min_value=-2.0, max_value=2.0, step=0.1,
+                    value=fp_val, key=f"{sid}_fp"
+                )
+                cfg["frequency_penalty"] = None if math.isclose(fp_val, 0.0) else float(fp_val)
 
-        cfg["include_csv"] = st.checkbox(f"[{sid}] CSVをプロンプトへ含める", value=cfg["include_csv"], key=f"{sid}_incl_csv")
-        if cfg["include_csv"]:
-            cfg["csv_days"] = st.slider(f"[{sid}] CSVの最新N日", 3, 31, cfg["csv_days"], 1, key=f"{sid}_csv_days")
-        cfg["system"] = st.text_area(f"[{sid}] System プロンプト", value=cfg["system"], height=100, key=f"{sid}_sys")
-        cfg["user"]   = st.text_area(f"[{sid}] User プロンプト（追加指示）", value=cfg["user"], height=140, key=f"{sid}_usr")
+            cfg["include_csv"] = st.checkbox(f"[{sid}] CSVをプロンプトへ含める", value=cfg["include_csv"], key=f"{sid}_incl_csv")
+            if cfg["include_csv"]:
+                cfg["csv_mode"] = st.radio(f"[{sid}] CSVの同梱モード", ["全期間", "最新N日"],
+                                           index=(0 if cfg["csv_mode"]=="全期間" else 1), key=f"{sid}_csv_mode", horizontal=True)
+                if cfg["csv_mode"] == "最新N日":
+                    cfg["csv_days"] = st.slider(f"[{sid}] CSVの最新N日", 3, 31, cfg["csv_days"], 1, key=f"{sid}_csv_days")
 
-        # 実行
-        run_btn = st.button(f"[{sid}] 推論を実行", key=f"{sid}_run", use_container_width=True)
+            cfg["system"] = st.text_area(f"[{sid}] System プロンプト", value=cfg["system"], height=100, key=f"{sid}_sys")
+            cfg["user"]   = st.text_area(f"[{sid}] User プロンプト（追加指示）", value=cfg["user"], height=140, key=f"{sid}_usr")
+
+            run_btn = st.form_submit_button(f"[{sid}] 推論を実行", use_container_width=True)
+
+        # 実行処理はフォームの外で
         if run_btn:
             if st.session_state.facts is None or st.session_state.df is None:
                 st.error("facts と CSV の両方が必要です。先に『データ取得』を行ってください。")
@@ -467,34 +524,28 @@ def slot_editor(sid: str):
             else:
                 with st.spinner(f"{sid}: OpenAI で推論中…"):
                     try:
-                        # 上書きを適用した features
                         ov_budget = float(override_budget) if use_override_budget else None
                         ov_target = override_target_date if use_override_target else None
-                        channels = st.session_state.raw[0].get("facts", {}).get("channels") if isinstance(st.session_state.raw, list) else {}
-                        # channelsは coerce で分離済みのため、セッション上にはない可能性があるので再構成
-                        # → 一貫のため、coerce時のchannelsを featuresに持たせる:
-                        #   st.session_state.features は実行時に都度作る
-                        facts, chs = st.session_state.facts, {}
-                        # coerceで channels を facts から分離した前提。rawに戻るのが難しいため、featuresは facts単体でもOK。
-                        # もし facts 内に channels が残っていれば拾う
-                        if "channels" in facts and isinstance(facts["channels"], dict):
-                            chs = facts["channels"]
+
+                        facts = st.session_state.facts
+                        chs = st.session_state.channels or facts.get("channels") or {}
 
                         features = build_features_for_prompt(facts, chs, ov_budget, ov_target)
 
-                        # CSV断片
-                        csv_snippet = None
+                        # CSV断片（全期間 or 最新N日）
+                        csv_snippet, csv_label = None, ""
                         if cfg["include_csv"]:
-                            try:
+                            if cfg["csv_mode"] == "全期間":
+                                csv_snippet = df_to_csv_text(st.session_state.df)
+                                csv_label = "全期間"
+                            else:
                                 df_slice = df_latest_days(st.session_state.df, int(cfg["csv_days"]))
                                 csv_snippet = df_to_csv_text(df_slice)
-                            except Exception as e:
-                                csv_snippet = None
-                                st.warning(f"CSV断片の生成に失敗: {e}")
+                                csv_label = f"最新{int(cfg['csv_days'])}日"
 
                         # 最終プロンプト生成
                         user_prompt, visible_prompt = make_final_prompt_text(
-                            cfg["system"], cfg["user"], features, cfg["include_csv"], csv_snippet
+                            cfg["system"], cfg["user"], features, cfg["include_csv"], csv_snippet, csv_label
                         )
                         cfg["final_prompt_preview"] = visible_prompt
 
@@ -506,7 +557,6 @@ def slot_editor(sid: str):
                         try:
                             obj = json.loads(raw_text.strip().strip("`"))
                         except json.JSONDecodeError:
-                            # フェンス付きなどの緊急除去
                             s = raw_text.strip()
                             if s.startswith("```"):
                                 parts = s.split("```")
@@ -517,7 +567,6 @@ def slot_editor(sid: str):
 
                         cfg["result"] = enforce_constraints(obj)
                         st.success(f"{sid}: 推論成功")
-
                     except requests.exceptions.HTTPError as e:
                         st.error(f"{sid}: OpenAI API エラー: {e}")
                     except json.JSONDecodeError as e:
@@ -525,6 +574,8 @@ def slot_editor(sid: str):
                         st.code(cfg.get("raw_output", "")[:1200])
                     except Exception as e:
                         st.error(f"{sid}: 推論に失敗: {e}")
+                        if cfg.get("raw_output"):
+                            st.code(cfg["raw_output"][:1200])
 
         # プレビュー（最終プロンプト / 生出力 / 整合後結果）
         if cfg.get("final_prompt_preview"):
@@ -536,7 +587,6 @@ def slot_editor(sid: str):
         if cfg.get("result"):
             res = cfg["result"]
             st.markdown(f"**[{sid}] 整合後の配分結果**")
-            td = res.get("report", {}).get("target_date") or st.session_state.facts.get("target_date", "")
             st.metric(f"[{sid}] 総額", f"¥{int(res.get('today_total_spend', 0)):,}")
             alloc = res.get("allocation", {})
             df_view = pd.DataFrame([
@@ -550,11 +600,22 @@ def slot_editor(sid: str):
                 st.write("**要約**")
                 st.write(res["report"]["executive_summary"])
 
-# スロットUI描画
-cA, cB, cC = st.columns(3)
-with cA: slot_editor("A")
-with cB: slot_editor("B")
-with cC: slot_editor("C")
+# ---------------------------
+# スロットUI描画（3カラム or タブ切替で崩れ軽減）
+# ---------------------------
+st.markdown("## Prompt Lab（A/B/C）— モデル/温度/プロンプト等を完全手動で設定")
+layout_mode = st.radio("スロットの表示方法", ["3カラム", "タブ"], horizontal=True, index=1)
+
+if layout_mode == "3カラム":
+    cA, cB, cC = st.columns(3, gap="large")
+    with cA: slot_editor("A")
+    with cB: slot_editor("B")
+    with cC: slot_editor("C")
+else:
+    tabA, tabB, tabC = st.tabs(["A", "B", "C"])
+    with tabA: slot_editor("A")
+    with tabB: slot_editor("B")
+    with tabC: slot_editor("C")
 
 # ---------------------------
 # 横比較ビュー
@@ -570,6 +631,8 @@ for sid in SLOT_IDS:
             "slot": sid,
             "model": cfg.get("model"),
             "temp": cfg.get("temperature"),
+            "CSV同梱": f"{cfg.get('csv_mode') if cfg.get('include_csv') else 'なし'}"
+                       + (f"（{int(cfg.get('csv_days',0))}日）" if cfg.get("include_csv") and cfg.get("csv_mode")=="最新N日" else ""),
             "total(¥)": int(res.get("today_total_spend", 0)),
             "IGFB_share(%)": round(alloc.get("IGFB",{}).get("share",0)*100,1),
             "Google_share(%)": round(alloc.get("Google",{}).get("share",0)*100,1),
