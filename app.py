@@ -18,31 +18,32 @@ st.set_page_config(page_title="AdAI 配分ビュー（facts+CSV必須 / A/B/C比
 JST = timezone(timedelta(hours=9))
 
 def inject_css(compact: bool = False):
+    # ヘッダー分(約56px) + 余白を常に確保
+    padding_top = "2.75rem" if not compact else "1.75rem"
+
     css = f"""
     <style>
+    /* 上マージン不足でタイトルが切れないようにする */
     .block-container {{
         max-width: 1400px;
-        padding-top: {'0.5rem' if compact else '1rem'};
+        padding-top: {padding_top};
         padding-bottom: 2rem;
+        scroll-padding-top: 80px; /* 内部アンカー移動時の被りも防止 */
     }}
-    pre, code {{
-        white-space: pre;
-        overflow-x: auto;
+    /* ページ最上部のタイトル周りを安全にする */
+    .block-container h1:first-of-type {{
+        margin-top: 0.25rem !important;
+        padding-top: 0.25rem !important;
+        line-height: 1.2 !important;
+        overflow: visible !important;
     }}
-    [data-testid="stDataFrame"] .ag-header-cell-label {{
-        white-space: nowrap !important;
-    }}
-    .stButton>button {{
-        width: 100%;
-    }}
-    div.row-widget.stRadio > div {{
-        flex-wrap: wrap;
-        gap: .5rem 1rem;
-    }}
-    .st-expander {{
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-    }}
+
+    /* 表やフォームの可読性を保ちつつ、狭幅でも崩れにくく */
+    [data-testid="stDataFrame"] .ag-header-cell-label {{ white-space: nowrap !important; }}
+    .stButton>button {{ width: 100%; }}
+    .st-expander {{ border: 1px solid #e5e7eb; border-radius: 12px; }}
+    div.row-widget.stRadio > div {{ flex-wrap: wrap; gap: .5rem 1rem; }}
+    pre, code {{ white-space: pre; overflow-x: auto; }}
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
@@ -334,6 +335,7 @@ def enforce_constraints(obj: dict) -> dict:
 # ---------------------------
 # UI: ヘッダ
 # ---------------------------
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)  # ← 追加（任意）
 st.title("AdAI 配分ビュー（facts+CSV 必須 / A-B-C プロンプト比較）")
 st.caption(f"現在時刻（JST）: {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')}")
 
