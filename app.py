@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # app.py
 # AdAI 配分ビュー（facts + CSV 必須 / プロンプトA/B/C比較）
 # - 初期表示で外部アクセスなし
@@ -5,6 +7,8 @@
 # - BASE_INSTRUCTIONS（共通ベース指示）を含む全プロンプトを UI で編集可
 # - A/B/C で model / temperature 等の任意パラメータは「指定する」ON時のみ送信
 # - 3カラム/タブ切替、最終投入プロンプト&生出力&整合後JSON 可視化
+from typing import Optional, Tuple
+
 
 import io, json, time, math
 from datetime import datetime, timezone, timedelta, date
@@ -286,15 +290,71 @@ def df_to_csv_text(df_slice: pd.DataFrame) -> str:
 # -------------------------------------------------
 # プロンプト生成 & OpenAI 呼び出し
 # -------------------------------------------------
-def build_features_for_prompt(facts: dict, channels: dict, override_budget, override_target):
-    f = dict(facts)
+from datetime import date as _date, timedelta as _td
+from typing import Optional
+
+def _end_of_month(d: _date) -> _date:
+    first_next = _date(d.year + (d.month == 12), (d.month % 12) + 1, 1)
+    return first_next - _td(days=1)
+
+def _safe_parse_yyyy_mm_dd(s: str) -> Optional[_date]:
+    try:
+        y, m, d = map(int, str(s).split("-"))
+        return _date(y, m, d)
+    except Exception:
+        return None
+
+def build_features_for_prompt(
+    facts: dict,
+    channels: dict,
+    override_budget: Optional[float],
+    override_target: Optional[_date],
+) -> dict:
+    """factsにUIの上書きを適用し、副作用項目（remaining_budget/remaining_days）を再計算"""
+    f = dict(facts)  # shallow copy
+
+    # 1) まず target_date を決める
+    tgt = override_target or _safe_parse_yyyy_mm_dd(f.get("target_date"))
+    # month_end は facts 優先、なければ target_date から算出
+    month_end = _safe_parse_yyyy_mm_dd(f.get("month_end"))
+    if tgt and not month_end:
+        month_end = _end_of_month(tgt)
+
+    # 2) 予算を上書き（任意）
     if override_budget is not None:
-        f["month_budget"] = float(override_budget)
-    if override_target is not None:
-        f["target_date"] = override_target.strftime("%Y-%m-%d")
+        # 小数入りでもOKだが、見栄えと整合のため整数へ
+        f["month_budget"] = int(round(float(override_budget)))
+
+    # 3) 対象日を上書き（任意）
+    if tgt:
+        f["target_date"] = tgt.strftime("%Y-%m-%d")
+
+    # 4) 残額の再計算（month_budget と mtd_spend があるとき）
+    month_budget = f.get("month_budget")
+    mtd_spend = f.get("mtd_spend")
+    try:
+        if month_budget is not None and mtd_spend is not None:
+            rb = float(month_budget) - float(mtd_spend)
+            f["remaining_budget"] = int(round(rb))  # マイナスも許容
+    except Exception:
+        # 型が変でも落ちないようにスキップ
+        pass
+
+    # 5) 残日数の再計算（対象日/月末が揃えば）
+    if tgt and month_end:
+        # その日を含めてカウント（例: 25→30 は 6日）
+        days = (month_end - tgt).days + 1
+        f["remaining_days"] = max(0, days)
+
     return {"facts": f, "channels": channels or {}}
 
-def make_final_prompt_text(system_text: str, user_text: str, features_obj: dict, include_csv: bool, csv_payload: str|None):
+def make_final_prompt_text(
+    system_text: str,
+    user_text: str,
+    features_obj: dict,
+    include_csv: bool,
+    csv_payload: Optional[str],
+) -> Tuple[str, str]:
     base_instr = st.session_state.base_instructions or ""
     body = base_instr + "\n\n" + json.dumps(features_obj, ensure_ascii=False, separators=(",", ":"))
     if include_csv and csv_payload:
@@ -513,7 +573,11 @@ def slot_editor(sid: str):
         if cfg["include_csv"]:
             c3, c4 = st.columns([1,1.5])
             with c3:
-                cfg["csv_mode"] = st.radio(f"[{sid}] CSV同梱モード", ["全期間", "最新N日"], index=(0 if cfg["csv_mode"]=="全期間" else 1), horizontal=True, key=f"{sid}_csv_mode")
+                cfg["csv_mode"] = st.radio(
+                    f"[{sid}] CSV同梱モード", ["全期間", "最新N日"],
+                    index=(0 if cfg["csv_mode"]=="全期間" else 1),
+                    horizontal=True, key=f"{sid}_csv_mode"
+                )
             with c4:
                 if cfg["csv_mode"] == "最新N日":
                     cfg["csv_days"] = st.slider(f"[{sid}] 最新N日", 3, 31, cfg["csv_days"], 1, key=f"{sid}_csv_days")
@@ -521,7 +585,10 @@ def slot_editor(sid: str):
         cfg["system"] = st.text_area(f"[{sid}] System プロンプト", value=cfg["system"], height=100, key=f"{sid}_sys")
         cfg["user"]   = st.text_area(f"[{sid}] User プロンプト（追加指示）", value=cfg["user"], height=140, key=f"{sid}_usr")
 
-        with st.expander(f"[{sid}] 高度なパラメータ（任意 / 指定時のみ送信）", expanded=False):
+        # ===== ここを expander から置き換え（ネスト回避） =====
+        show_adv = st.checkbox(f"[{sid}] 高度なパラメータを表示", value=False, key=f"{sid}_adv_toggle")
+        if show_adv:
+            st.markdown(":wrench: **高度なパラメータ（任意 / 指定時のみ送信）**")
             cA, cB, cC = st.columns(3)
             with cA:
                 cfg["use_temperature"] = st.checkbox(f"[{sid}] temperature を指定", value=cfg["use_temperature"], key=f"{sid}_use_temp")
@@ -549,6 +616,7 @@ def slot_editor(sid: str):
                 cfg["use_frequency_penalty"] = st.checkbox(f"[{sid}] frequency_penalty を指定", value=cfg["use_frequency_penalty"], key=f"{sid}_use_fp")
                 if cfg["use_frequency_penalty"]:
                     cfg["frequency_penalty"] = st.number_input(f"[{sid}] frequency_penalty", min_value=-2.0, max_value=2.0, step=0.1, value=float(cfg["frequency_penalty"]), key=f"{sid}_fp_val")
+        # ===== 置き換えここまで =====
 
         # 実行
         run_btn = st.button(f"[{sid}] 推論を実行", key=f"{sid}_run", use_container_width=True)
@@ -563,6 +631,7 @@ def slot_editor(sid: str):
                         ov_budget = float(override_budget) if use_override_budget else None
                         ov_target = override_target_date if use_override_target else None
                         features = build_features_for_prompt(st.session_state.facts, st.session_state.channels, ov_budget, ov_target)
+                        cfg["features_snapshot"] = features  # 上書き後 facts を確認用に保持
 
                         # CSV payload
                         csv_payload = None
@@ -603,7 +672,7 @@ def slot_editor(sid: str):
                     except Exception as e:
                         st.error(f"{sid}: 推論に失敗: {e}")
 
-        # プレビュー（最終プロンプト / 生出力 / 整合後）
+        # プレビュー
         if cfg.get("final_prompt_preview"):
             st.markdown(f"**[{sid}] 最終プロンプト（実投入内容の可視化）**")
             st.code(cfg["final_prompt_preview"])
@@ -613,9 +682,7 @@ def slot_editor(sid: str):
         if cfg.get("result"):
             res = cfg["result"]
             st.markdown(f"**[{sid}] 整合後の配分結果**")
-            td = res.get("report", {}).get("target_date") or st.session_state.facts.get("target_date", "")
             st.metric(f"[{sid}] 総額", f"¥{int(res.get('today_total_spend', 0)):,}")
-
             alloc = res.get("allocation", {})
             df_view = pd.DataFrame([
                 {"media":"IGFB",  "share(%)": round((alloc.get("IGFB",{}).get("share",0))*100,1),  "amount(¥)": alloc.get("IGFB",{}).get("amount",0)},
@@ -624,10 +691,19 @@ def slot_editor(sid: str):
                 {"media":"Tik",   "share(%)": round((alloc.get("Tik",{}).get("share",0))*100,1),   "amount(¥)": alloc.get("Tik",{}).get("amount",0)},
             ])
             st.dataframe(df_view, use_container_width=True)
-
-            # ▼▼ ここから追加：理由・レポートの詳細をまとめて描画 ▼▼
             render_reasoning_and_report(res, sid)
-            # ▲▲ ここまで追加 ▲▲
+
+            # features スナップショットの表示（任意）
+            show_feat = st.checkbox(f"[{sid}] このスロットに投入した features を表示", value=False, key=f"{sid}_show_feat")
+            if show_feat and cfg.get("features_snapshot"):
+                # remaining_budget が負の場合は赤字警告を表示
+                feat = cfg["features_snapshot"]
+                facts = feat.get("facts", {})
+                rb = facts.get("remaining_budget")
+                if rb is not None and rb < 0:
+                    st.warning(f"⚠️ 残予算がマイナスです: ¥{rb:,}")
+                st.code(json.dumps(feat, ensure_ascii=False, indent=2))
+
 
 # スロット表示（3カラム / タブ 切替）
 st.markdown("### スロットの表示方法")
